@@ -84,6 +84,8 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
 
+#define RQE_Q_CAP 35000
+
 /*
  * Convert user-nice values [ -20 ... 0 ... 19 ]
  * to static priority [ MAX_RT_PRIO..MAX_PRIO-1 ],
@@ -306,6 +308,50 @@ struct task_group root_task_group;
 
 #endif	/* CONFIG_CGROUP_SCHED */
 
+//static struct proc_dir_entry *proc_entry;
+
+//Record pages
+struct RQE_Entry{  
+  //App name and process ID
+  char name[TASK_COMM_LEN];
+  pid_t taskId;
+
+  //Event time and what type of event it was
+  u64 eventTime; 
+  char eventType; 
+
+  //Priority 
+  unsigned int staticP;
+  int prio;
+  int normPrio;
+  int rt_prio;
+
+ 
+  u64 vrun;
+  
+  unsigned long numTasks;
+ 
+  u64 seqNum;
+
+  long long switches;
+};
+
+//The Collection
+struct RQE_Queue{
+  struct RQE_Entry buffer[RQE_Q_CAP];
+  int rqe_insertIdx;
+  int rqe_deleteIdx;
+  u64 rqe_seqNum;
+  int rqe_population;
+  int rqe_initialized;
+  int rqe_system_thread_calls;
+  int rqe_logging_threads_calls;
+  int rqe_queue_kworker_start_time;
+  int rqe_queue_kworker_sum_total;
+  int rqe_kworker_thread;
+
+};
+
 /* CFS-related fields in a runqueue */
 struct cfs_rq {
 	struct load_weight load;
@@ -452,7 +498,7 @@ static struct root_domain def_root_domain;
  * acquire operations must be ordered by ascending &runqueue.
  */
 struct rq {
-	/* runqueue lock: */
+        /* runqueue lock: */
 	raw_spinlock_t lock;
 
 	/*
@@ -476,7 +522,9 @@ struct rq {
 
 	struct cfs_rq cfs;
 	struct rt_rq rt;
-
+        struct RQE_Queue rqe_Queue;
+        
+  
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	/* list of leaf cfs_rq on this cpu: */
 	struct list_head leaf_cfs_rq_list;
@@ -565,6 +613,7 @@ struct rq {
 	struct task_struct *wake_list;
 #endif
 };
+
 
 static DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
 
@@ -1805,18 +1854,112 @@ static void set_load_weight(struct task_struct *p)
 	load->inv_weight = prio_to_wmult[prio];
 }
 
+
+static int rqe_discern_purpose_of_thread(struct task_struct *p)
+{
+  char task[6];
+
+  task[0] = p->comm[0];
+  task[1] = p->comm[1];
+  task[2] = p->comm[2];
+  task[3] = p->comm[3];
+  task[4] = p->comm[4];
+  task[5] = p->comm[5];
+
+  //task struct is a system call
+  if((task[0] == 'k' && task[1] == 'w' && task[2] == 'o' && task[3] == 'r')){
+    
+    return 2;
+  }
+
+ //task struct writes to ADB console or sdcard
+  else if((task[0] == 'a' && task[1] == 'd' && task[2] == 'b' && task[3] == 'd') || (task[0] == 's' && task[1] == 'd' && task[2] == 'c' && task[3] == 'a' && task[4] == 'r' && task[5] == 'd')){
+    
+    return 1;
+  }
+
+ //Everything else
+  else{
+    return 0;
+  }
+
+}
+
+
+static inline void rqe_insert(struct rq *rq, struct task_struct *p, int flags, char rqe_type)
+{
+  if (!(rq->rqe_Queue.rqe_initialized))
+    return;
+
+  if(rq->rqe_Queue.rqe_population == RQE_Q_CAP){ 
+    rq->rqe_Queue.rqe_seqNum++;
+    //printk(KERN_NOTICE, "BREAK AT %d",rq->rqe_Queue.rqe_population);
+    return; 
+    }
+ 
+
+  int purpose = rqe_discern_purpose_of_thread(p);
+  if (purpose == 2){
+    rq->rqe_Queue.rqe_system_thread_calls++;
+
+    if(rq->rqe_Queue.rqe_kworker_thread == -1){
+      rq->rqe_Queue.rqe_kworker_thread = p->pid;
+    }
+
+    if(rq->rqe_Queue.rqe_queue_kworker_start_time == -1 && rqe_type == "R" && rq->rqe_Queue.rqe_kworker_thread != -1){
+      rq->rqe_Queue.rqe_queue_kworker_start_time == p->se.sum_exec_runtime;
+    }
+
+    else if (rq->rqe_Queue.rqe_queue_kworker_start_time != -1 && rqe_type == "B" && rq->rqe_Queue.rqe_kworker_thread != -1){
+      rq->rqe_Queue.rqe_queue_kworker_sum_total += (p->se.sum_exec_runtime - rq->rqe_Queue.rqe_queue_kworker_start_time);
+      rq->rqe_Queue.rqe_queue_kworker_start_time = -1;
+      rq->rqe_Queue.rqe_kworker_thread = -1;
+    }
+  }
+
+  else if (purpose == 1){
+    rq->rqe_Queue.rqe_logging_threads_calls++;
+  }
+
+  else{
+    int i=0;
+    for(i=0;i<16;i++)
+      rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].name[i] = p->comm[i];
+
+    rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].eventType = rqe_type;
+    rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].taskId = p->pid;
+    rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].rt_prio = p->rt_priority;
+    rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].staticP = p->static_prio;
+    rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].normPrio = p->normal_prio;
+    rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].prio = p->prio;	  
+    rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].vrun = (p->se.sum_exec_runtime);
+    rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].numTasks = ((unsigned long)rq->nr_running);  
+    rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].eventTime = (sched_clock());  
+    rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].seqNum = rq->rqe_Queue.rqe_seqNum++;
+    rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].switches = ((long long)p->nivcsw) + ((long long)p->nvcsw);
+
+    rq->rqe_Queue.rqe_population--;
+    rq->rqe_Queue.rqe_insertIdx = (rq->rqe_Queue.rqe_insertIdx + 1) % RQE_Q_CAP;
+  }
+}
 static void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 {
 	update_rq_clock(rq);
 	sched_info_queued(p);
 	p->sched_class->enqueue_task(rq, p, flags);
+	
+	//rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].eventType=1;
+	rqe_insert(rq,p,flags,'E');
 }
 
 static void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
-{
+{       
 	update_rq_clock(rq);
 	sched_info_dequeued(p);
 	p->sched_class->dequeue_task(rq, p, flags);
+	
+	//rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_insertIdx].eventType=0;
+	rqe_insert(rq,p,flags,'D');
 }
 
 /*
@@ -2829,6 +2972,9 @@ void sched_fork(struct task_struct *p)
 	int cpu = get_cpu();
 
 	__sched_fork(p);
+
+	//rqe_insert(cpu_rq(p->on_rq),p,0,'F');
+
 	/*
 	 * We mark the process as running here. This guarantees that
 	 * nobody will actually run it, and a signal or other external
@@ -2909,6 +3055,8 @@ void wake_up_new_task(struct task_struct *p)
 {
 	unsigned long flags;
 	struct rq *rq;
+	
+	//rqe_insert(rq,p,0,'C');
 
 	raw_spin_lock_irqsave(&p->pi_lock, flags);
 #ifdef CONFIG_SMP
@@ -2930,6 +3078,7 @@ void wake_up_new_task(struct task_struct *p)
 		p->sched_class->task_woken(rq, p);
 #endif
 	task_rq_unlock(rq, p, &flags);
+
 }
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
@@ -3186,6 +3335,11 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	 * frame will be invalid.
 	 */
 	finish_task_switch(this_rq(), prev);
+
+	/*if(prev->pid != next->pid){
+	  rqe_insert(this_rq(),next,0,'W');
+	  }
+	*/
 }
 
 /*
@@ -3653,6 +3807,8 @@ void sched_exec(void)
 	}
 unlock:
 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+
+	//rqe_insert(cpu_rq(dest_cpu),p,0,'X');
 }
 
 #endif
@@ -3677,7 +3833,8 @@ static u64 do_task_delta_exec(struct task_struct *p, struct rq *rq)
 		if ((s64)ns < 0)
 			ns = 0;
 	}
-
+	
+	
 	return ns;
 }
 
@@ -3690,7 +3847,7 @@ unsigned long long task_delta_exec(struct task_struct *p)
 	rq = task_rq_lock(p, &flags);
 	ns = do_task_delta_exec(p, rq);
 	task_rq_unlock(rq, p, &flags);
-
+	
 	return ns;
 }
 
@@ -3706,9 +3863,13 @@ unsigned long long task_sched_runtime(struct task_struct *p)
 	u64 ns = 0;
 
 	rq = task_rq_lock(p, &flags);
-	ns = p->se.sum_exec_runtime + do_task_delta_exec(p, rq);
-	task_rq_unlock(rq, p, &flags);
 
+	//the delta for execTime
+	u64 de=do_task_delta_exec(p, rq);
+
+	ns = p->se.sum_exec_runtime + de;
+	task_rq_unlock(rq, p, &flags);
+   
 	return ns;
 }
 
@@ -4281,6 +4442,7 @@ need_resched:
 		++*switch_count;
 
 		context_switch(rq, prev, next); /* unlocks the rq */
+
 		/*
 		 * The context switch have flipped the stack from under us
 		 * and restored the local variables which were saved when
@@ -5521,6 +5683,8 @@ SYSCALL_DEFINE0(sched_yield)
 
 	schedstat_inc(rq, yld_count);
 	current->sched_class->yield_task(rq);
+	
+	//rqe_insert(rq,current,0,'Y');
 
 	/*
 	 * Since we are going to call schedule() anyway, there's
@@ -5860,6 +6024,7 @@ void show_state_filter(unsigned long state_filter)
 
 #ifdef CONFIG_SCHED_DEBUG
 	sysrq_sched_debug_show();
+	sysrq_rqDebug();
 #endif
 	read_unlock(&tasklist_lock);
 	/*
@@ -5886,7 +6051,7 @@ void __cpuinit init_idle(struct task_struct *idle, int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
 	unsigned long flags;
-
+	
 	raw_spin_lock_irqsave(&rq->lock, flags);
 
 	__sched_fork(idle);
@@ -7929,6 +8094,7 @@ static void init_cfs_rq(struct cfs_rq *cfs_rq, struct rq *rq)
 #ifndef CONFIG_64BIT
 	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
 #endif
+
 }
 
 static void init_rt_rq(struct rt_rq *rt_rq, struct rq *rq)
@@ -8022,9 +8188,9 @@ static void init_tg_rt_entry(struct task_group *tg, struct rt_rq *rt_rq,
 
 void __init sched_init(void)
 {
-	int i, j;
+        int i, j;
 	unsigned long alloc_size = 0, ptr;
-
+	
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	alloc_size += 2 * nr_cpu_ids * sizeof(void **);
 #endif
@@ -8092,6 +8258,18 @@ void __init sched_init(void)
 #ifdef CONFIG_FAIR_GROUP_SCHED
 		root_task_group.shares = root_task_group_load;
 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
+
+		
+	        //Logging must be turned on with /proc/SEQ_RQ
+	        rq->rqe_Queue.rqe_initialized=0;
+		rq->rqe_Queue.rqe_insertIdx=0;
+		rq->rqe_Queue.rqe_deleteIdx=0;
+		rq->rqe_Queue.rqe_seqNum=0;
+		rq->rqe_Queue.rqe_population=RQE_Q_CAP;
+
+		printk(KERN_NOTICE "RQE VALUES SET");
+
+
 		/*
 		 * How much cpu bandwidth does root_task_group get?
 		 *
@@ -8145,6 +8323,7 @@ void __init sched_init(void)
 #endif
 		init_rq_hrtick(rq);
 		atomic_set(&rq->nr_iowait, 0);
+	
 	}
 
 	set_load_weight(&init_task);

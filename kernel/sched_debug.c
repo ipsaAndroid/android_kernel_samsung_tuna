@@ -1,5 +1,4 @@
-/*
- * kernel/time/sched_debug.c
+/* kernel/time/sched_debug.c
  *
  * Print the CFS rbtree
  *
@@ -10,13 +9,28 @@
  * published by the Free Software Foundation.
  */
 
+#include <linux/fs.h>			/* for sprintf */
 #include <linux/proc_fs.h>
 #include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/kallsyms.h>
 #include <linux/utsname.h>
 
+#define RQE_Q_CAP 35000
+#define RQ_DEBUG 1
+#define BLCK_SIZE 8192
+#define BLK_PAD 200
+
+static char logEntry[BLCK_SIZE];
+static int firstWrite = 1;
+static char debugFailed[9];
+static unsigned int failedWrites=0;
 static DEFINE_SPINLOCK(sched_debug_lock);
+
+static int rtnStatus=1;
+static int stopIndex=0;
+
+
 
 /*
  * This allows printing both to /proc/sched_debug and
@@ -373,14 +387,116 @@ static int sched_debug_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+static int rqRESET(struct seq_file *m, void *v)
+{
+  struct rq *rq = cpu_rq(0);
+  
+  SEQ_printf(m,"---- RESET ----\n");
+  rq->rqe_Queue.rqe_insertIdx = 0;
+  rq->rqe_Queue.rqe_deleteIdx = 0;
+  rq->rqe_Queue.rqe_seqNum = 0;
+  rq->rqe_Queue.rqe_population = 0;
+  rq->rqe_Queue.rqe_initialized = 1;
+  rq->rqe_Queue.rqe_system_thread_calls = 0;
+  rq->rqe_Queue.rqe_logging_threads_calls = 0;
+  rq->rqe_Queue.rqe_queue_kworker_start_time = -1;
+  rq->rqe_Queue.rqe_queue_kworker_sum_total = 0;
+  rq->rqe_Queue.rqe_kworker_thread = -1;
+  
+  failedWrites = 0;
+  return 0;
+}
+
+//For only Rq0, add more cases for more run cores
+static int rqe_Get(struct seq_file *m, void *v)
+{
+  struct rq *rq = cpu_rq(0);
+  if (rq->rqe_Queue.rqe_deleteIdx == stopIndex){
+    return NULL;
+  }
+  int logEntryLen=0,
+    lenWritten=0,
+    first_seqNum = rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_deleteIdx].seqNum,
+    last_seqNum,
+    first_qIndx = rq->rqe_Queue.rqe_deleteIdx, last_qIndx;
+   
+  if (firstWrite) {
+    char buf[100];
+    int nChars = sprintf(buf, "yy1: start=%d, end=%d\n", first_seqNum, last_seqNum);
+    seq_write(m, "yy1\n", 4);
+    firstWrite = 0;
+  }
+
+  int i=sprintf(&debugFailed,"yy2:%d %d sys %d sum sys time %d log\n",failedWrites, rq->rqe_Queue.rqe_system_thread_calls,rq->rqe_Queue.rqe_queue_kworker_sum_total,rq->rqe_Queue.rqe_logging_threads_calls);
+  seq_write(m,debugFailed,i);
+  //While memory remains for the proc entry keep filling buffer
+  while ((logEntryLen <= (BLCK_SIZE - BLK_PAD)) && (rq->rqe_Queue.rqe_deleteIdx != stopIndex)) {
+    int target=stopIndex-rq->rqe_Queue.rqe_deleteIdx; 
+    // print single entry into log
+    logEntryLen +=
+      sprintf(&logEntry[logEntryLen], "%lld,%s,%ld,%c,%Ld.%06ld,%Ld.%06ld,%ld,%llu\n",
+	      rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_deleteIdx].seqNum, /* long long */
+	      rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_deleteIdx].name, /* str */
+	      rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_deleteIdx].taskId, /* int */
+	      rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_deleteIdx].eventType, /* char!! */
+	      SPLIT_NS(rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_deleteIdx].eventTime), /* times, in ns */
+	      SPLIT_NS(rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_deleteIdx].vrun), /*float in ns*/
+	      rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_deleteIdx].normPrio, /*int*/
+	      rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_deleteIdx].switches /*long long*/
+	      ); 
+    rq->rqe_Queue.rqe_population--;
+    rq->rqe_Queue.rqe_deleteIdx = (rq->rqe_Queue.rqe_deleteIdx + 1) % RQE_Q_CAP;
+  } // end While
+  last_seqNum = rq->rqe_Queue.buffer[rq->rqe_Queue.rqe_deleteIdx].seqNum;
+  last_qIndx = rq->rqe_Queue.rqe_deleteIdx;
+  // block write entries into seq file
+  lenWritten=seq_write(m, logEntry, logEntryLen);
+
+  //If the write fails, do it again upon the next block write
+  if (lenWritten){
+    rq->rqe_Queue.rqe_deleteIdx=first_qIndx;
+    rq->rqe_Queue.rqe_population-=(last_qIndx - first_qIndx);
+    failedWrites++;
+  }
+
+  //printk("yy2 seqNums %d..%d pop%d: tried to write- %d wrote-%d \n",
+  //	first_seqNum, last_seqNum, rq->rqe_Queue.rqe_population, logEntryLen,lenWritten);
+
+  if(!logEntryLen || rq->rqe_Queue.rqe_deleteIdx == stopIndex)
+    return NULL;
+  else
+    return 1;
+}
+
 static void sysrq_sched_debug_show(void)
 {
 	sched_debug_show(NULL, NULL);
 }
 
+static void sysrq_rqDebug(void)
+{
+	rqe_Get(NULL, NULL);
+}
+
+static void sysrq_rqRESET(void)
+{
+	rqRESET(NULL, NULL);
+}
+
 static int sched_debug_open(struct inode *inode, struct file *filp)
 {
 	return single_open(filp, sched_debug_show, NULL);
+}
+
+static int rq_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, rqe_Get, NULL);
+}
+
+
+static int hr_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, rqRESET, NULL);
 }
 
 static const struct file_operations sched_debug_fops = {
@@ -390,17 +506,127 @@ static const struct file_operations sched_debug_fops = {
 	.release	= single_release,
 };
 
+static const struct file_operations RQ_fops = {
+	.open		= rq_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static const struct file_operations HR_fops = {
+	.open		= hr_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 static int __init init_sched_debug_procfs(void)
 {
-	struct proc_dir_entry *pe;
+  struct proc_dir_entry *pe;
 
-	pe = proc_create("sched_debug", 0444, NULL, &sched_debug_fops);
-	if (!pe)
-		return -ENOMEM;
-	return 0;
+  pe = proc_create("sched_debug", 0444, NULL, &sched_debug_fops);
+  if (!pe)
+    return -ENOMEM;
+  return 0;
 }
 
+static void *rq_seq_start(struct seq_file *s, loff_t *pos)
+{
+  struct rq *rq = cpu_rq(0); 
+  if(rq->rqe_Queue.rqe_deleteIdx == stopIndex){
+    if (RQ_DEBUG) {printk("END CONDITION MET %d <--> %d!\n",rq->rqe_Queue.rqe_deleteIdx,stopIndex);}
+    return NULL;
+  }
+  if (RQ_DEBUG) {printk("BEGIN LOGS %d <--> %d!\n",rq->rqe_Queue.rqe_deleteIdx,stopIndex);}
+  return rtnStatus;
+}
+
+static void *rq_seq_next(struct seq_file *s, void *v, loff_t *pos)
+{
+  struct rq *rq = cpu_rq(0);
+  if(rq->rqe_Queue.rqe_deleteIdx == stopIndex){
+    if (RQ_DEBUG) {printk("SHOULD EXIT %d <--> %d!\n",rq->rqe_Queue.rqe_deleteIdx,stopIndex);}
+    return NULL;
+  }
+  if (RQ_DEBUG) {printk("RESUME %d <--> %d!\n",rq->rqe_Queue.rqe_deleteIdx,stopIndex);}
+  return rtnStatus;
+}
+
+static void rq_seq_stop(struct seq_file *s, void *v)
+{
+  return;
+}
+
+static int rq_seq_show(struct seq_file *s, void *v)
+{
+  rtnStatus=rqe_Get(s,v);
+  return 0;
+}
+
+static struct seq_operations rq_seq_ops = {
+  .start = rq_seq_start,
+  .next  = rq_seq_next,
+  .stop  = rq_seq_stop,
+  .show  = rq_seq_show
+};
+
+static int rq0_open(struct inode *inode, struct file *file)
+{
+  struct rq *rq = cpu_rq(0);
+  if (RQ_DEBUG) {printk("RQ_DEBUG HAS BEEN OPENED!\n");}
+  rq->rqe_Queue.rqe_initialized=1;
+  firstWrite=1;
+  rtnStatus=1;
+  stopIndex=rq->rqe_Queue.rqe_insertIdx;
+  return seq_open(file, &rq_seq_ops);
+}
+
+static struct file_operations rq_file_ops = {
+  .owner   = THIS_MODULE,
+  .open    = rq0_open,
+  .read    = seq_read,
+  .llseek  = seq_lseek,
+  .release = seq_release
+};
+
+static int __init init_seq_procfs(void)
+{
+        struct proc_dir_entry *lib;
+
+        lib = proc_create("SEQ_RQ", 0444, NULL, &rq_file_ops);
+	if (!lib)
+		return -ENOMEM;
+	return 0;
+} 
+
+//This is my proc file system for the library
+static int __init init_RQ_procfs(void)
+{
+        struct proc_dir_entry *lib;
+
+        lib = proc_create("RQ_Debug", 0444, NULL, &RQ_fops);
+	if (!lib)
+		return -ENOMEM;
+	return 0;
+} 
+
+static int __init init_HR(void)
+{
+        struct proc_dir_entry *lib;
+
+        lib = proc_create("HARD_RESET", 0444, NULL, &HR_fops);
+	if (!lib)
+		return -ENOMEM;
+	return 0;
+} 
+
+
 __initcall(init_sched_debug_procfs);
+
+//My init calls
+__initcall(init_RQ_procfs);
+__initcall(init_HR);
+__initcall(init_seq_procfs);
 
 void proc_sched_show_task(struct task_struct *p, struct seq_file *m)
 {
@@ -506,3 +732,4 @@ void proc_sched_set_task(struct task_struct *p)
 	memset(&p->se.statistics, 0, sizeof(p->se.statistics));
 #endif
 }
+
